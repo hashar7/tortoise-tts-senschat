@@ -178,10 +178,35 @@ class VoiceBpeTokenizer:
         txt = english_cleaners(txt)
         return txt
 
-    def encode(self, txt):
-        txt = self.preprocess_text(txt)
-        txt = txt.replace(' ', '[SPACE]')
-        return self.tokenizer.encode(txt).ids
+    # def encode(self, txt):
+    #     txt = self.preprocess_text(txt)
+    #     txt = txt.replace(' ', '[SPACE]')
+    #     return self.tokenizer.encode(txt).ids
+
+    def encode(self, txt_arr):
+        txt_arr = [
+          self.preprocess_text(txt)
+          for txt in txt_arr
+        ]
+        txt_arr = [
+          txt + " " * (len(max(txt_arr, key=len)) - len(txt))
+          for txt in txt_arr
+        ]
+        txt_arr = [
+          re.sub(' ', '[SPACE]', txt)
+          for txt in txt_arr
+        ]
+        txt_arr = self.tokenizer.encode_batch(txt_arr)
+        txt_arr = [
+          txt.ids
+          for txt in txt_arr
+        ]
+        txt_arr = [
+          txt + [2] * (len(max(txt_arr, key=len)) - len(txt))
+          for txt in txt_arr
+        ]
+        return txt_arr
+
 
     def decode(self, seq):
         if isinstance(seq, torch.Tensor):

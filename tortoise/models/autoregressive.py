@@ -95,6 +95,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
+
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
@@ -129,15 +130,15 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         )
 
         # Create embedding
-        mel_len = self.cached_mel_emb.shape[1]
+        mel_len = self.cached_mel_emb.shape[2]
         if input_ids.shape[1] != 1:
             text_inputs = input_ids[:, mel_len:]
             text_emb = self.embeddings(text_inputs)
-            text_emb = text_emb + self.text_pos_embedding(text_emb)
             if self.cached_mel_emb.shape[0] != text_emb.shape[0]:
                 mel_emb = self.cached_mel_emb.repeat_interleave(
-                    text_emb.shape[0] // self.cached_mel_emb.shape[0], 0
+                    text_emb.shape[0] // self.cached_mel_emb.shape[1], 0
                 )
+                mel_emb = mel_emb.reshape(mel_emb.shape[0] * mel_emb.shape[1], mel_emb.shape[2], -1)
             else:  # this outcome only occurs once per loop in most cases
                 mel_emb = self.cached_mel_emb
             emb = torch.cat([mel_emb, text_emb], dim=1)
@@ -235,7 +236,11 @@ class LearnedPositionEmbeddings(nn.Module):
         self.emb.weight.data.normal_(mean=0.0, std=init)
 
     def forward(self, x):
-        sl = x.shape[1]
+        # if len(x.shape) > 3:
+        #     sl = x.shape[2]
+        # else:
+        #     sl = x.shape[1]
+        sl = x.shape[-1]
         return self.emb(torch.arange(0, sl, device=x.device))
 
     def get_fixed_embedding(self, ind, dev):
@@ -510,18 +515,16 @@ class UnifiedVoice(nn.Module):
         loss_mel = F.cross_entropy(mel_logits, mel_targets.long())
         return loss_text.mean(), loss_mel.mean(), mel_logits
 
-    def inference_speech(self, speech_conditioning_latent, text_inputs, input_tokens=None, num_return_sequences=1,
+    def prepare_inference_speech(self, speech_conditioning_latent, text_inputs, input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):        
 
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
-
-        conds = speech_conditioning_latent.unsqueeze(1)
-        emb = torch.cat([conds, text_emb], dim=1)
+        conds = speech_conditioning_latent.unsqueeze(1).repeat(1, text_inputs.shape[1], 1).reshape(1, text_inputs.shape[1], 1, -1)
+        emb = torch.cat([conds, text_emb], dim=2)
         self.inference_model.store_mel_emb(emb)
-
-        fake_inputs = torch.full((emb.shape[0], conds.shape[1] + emb.shape[1],), fill_value=1, dtype=torch.long,
+        fake_inputs = torch.full((emb.shape[1], conds.shape[2] + emb.shape[2],), fill_value=1, dtype=torch.long,
                                  device=text_inputs.device)
         fake_inputs[:, -1] = self.start_mel_token
         trunc_index = fake_inputs.shape[1]
@@ -535,9 +538,23 @@ class UnifiedVoice(nn.Module):
 
         logits_processor = LogitsProcessorList([TypicalLogitsWarper(mass=typical_mass)]) if typical_sampling else LogitsProcessorList()
         max_length = trunc_index + self.max_mel_tokens - 1  if max_generate_length is None else trunc_index + max_generate_length
+
+        return inputs, logits_processor, max_length, trunc_index
+
+    def inference_speech(
+            self,
+            inputs,
+            logits_processor,
+            max_length,
+            trunc_index,
+            num_return_sequences=1,
+            **hf_generate_kwargs
+        ):
+
         gen = self.inference_model.generate(inputs, bos_token_id=self.start_mel_token, pad_token_id=self.stop_mel_token, eos_token_id=self.stop_mel_token,
                                             max_length=max_length, logits_processor=logits_processor,
                                             num_return_sequences=num_return_sequences, **hf_generate_kwargs)
+
         return gen[:, trunc_index:]
 
 

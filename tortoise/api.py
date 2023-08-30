@@ -535,128 +535,140 @@ class TextToSpeech:
                         codes = F.pad(codes, (0, padding_needed), value=self.autoregressive.stop_mel_token)
                         samples.append(codes)
 
-                clip_results = []
-                
-                if not torch.backends.mps.is_available():
-                    with self.temporary_cuda(self.clvp) as clvp, torch.autocast(
-                        device_type="cuda" if not torch.backends.mps.is_available() else 'mps', dtype=torch.float16, enabled=self.half
-                    ):
-                        if cvvp_amount > 0:
-                            if self.cvvp is None:
-                                self.load_cvvp()
-                            self.cvvp = self.cvvp.to(self.device)
-                        if verbose:
-                            if self.cvvp is None:
-                                print("Computing best candidates using CLVP")
+            clip_results = []
+            
+            if not torch.backends.mps.is_available():
+                with self.temporary_cuda(self.clvp) as clvp, torch.autocast(
+                    device_type="cuda" if not torch.backends.mps.is_available() else 'mps', dtype=torch.float16, enabled=self.half
+                ):
+                    if cvvp_amount > 0:
+                        if self.cvvp is None:
+                            self.load_cvvp()
+                        self.cvvp = self.cvvp.to(self.device)
+                    if verbose:
+                        if self.cvvp is None:
+                            print("Computing best candidates using CLVP")
+                        else:
+                            print(f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
+                    for batch in tqdm(samples, disable=not verbose):
+                        for i in range(batch.shape[0]):
+                            batch[i] = fix_autoregressive_output(batch[i], self.autoregressive.stop_mel_token)
+                        if cvvp_amount != 1:
+                            clvp_input = text_tokens.reshape(text_tokens.shape[1], 1, -1).repeat(1, batch.shape[0] // text_tokens.shape[1], 1)
+                            clvp_input = clvp_input.reshape(clvp_input.shape[0] * clvp_input.shape[1], clvp_input.shape[2])
+                            clvp_out = clvp(clvp_input, batch, return_loss=False)
+                        if auto_conds is not None and cvvp_amount > 0:
+                            cvvp_accumulator = 0
+                            for cl in range(auto_conds.shape[1]):
+                                cvvp_accumulator = cvvp_accumulator + self.cvvp(auto_conds[:, cl].repeat(batch.shape[0], 1, 1), batch, return_loss=False)
+                            cvvp = cvvp_accumulator / auto_conds.shape[1]
+                            if cvvp_amount == 1:
+                                clip_results.append(cvvp)
                             else:
-                                print(f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
-                        for batch in tqdm(samples, disable=not verbose):
-                            for i in range(batch.shape[0]):
-                                batch[i] = fix_autoregressive_output(batch[i], self.autoregressive.stop_mel_token)
-                            if cvvp_amount != 1:
-                                clvp_out = clvp(text_tokens.repeat(batch.shape[0], 1), batch, return_loss=False)
-                            if auto_conds is not None and cvvp_amount > 0:
-                                cvvp_accumulator = 0
-                                for cl in range(auto_conds.shape[1]):
-                                    cvvp_accumulator = cvvp_accumulator + self.cvvp(auto_conds[:, cl].repeat(batch.shape[0], 1, 1), batch, return_loss=False)
-                                cvvp = cvvp_accumulator / auto_conds.shape[1]
-                                if cvvp_amount == 1:
-                                    clip_results.append(cvvp)
-                                else:
-                                    clip_results.append(cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
+                                clip_results.append(cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
+                        else:
+                            clip_results.append(clvp_out)
+                    clip_results = torch.cat(clip_results, dim=0)
+                    samples = torch.cat(samples, dim=0)
+                    best_results = torch.cat(
+                        [
+                            samples[
+                            torch.topk(
+                                clip_results[clip_results.shape[0]//text_tokens.shape[1]*(i-1):clip_results.shape[0]//text_tokens.shape[1]*i],
+                                k=k
+                            ).indices]
+                            for i in range(1, text_tokens.shape[1] + 1)
+                        ],
+                        dim=0
+                    )
+            else:
+                with self.temporary_cuda(self.clvp) as clvp:
+                    if cvvp_amount > 0:
+                        if self.cvvp is None:
+                            self.load_cvvp()
+                        self.cvvp = self.cvvp.to(self.device)
+                    if verbose:
+                        if self.cvvp is None:
+                            print("Computing best candidates using CLVP")
+                        else:
+                            print(f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
+                    for batch in tqdm(samples, disable=not verbose):
+                        for i in range(batch.shape[0]):
+                            batch[i] = fix_autoregressive_output(batch[i], self.autoregressive.stop_mel_token)
+                        if cvvp_amount != 1:
+                            clvp_input = text_tokens.reshape(text_tokens.shape[1], 1, -1).repeat(1, batch.shape[0] // text_tokens.shape[1], 1)
+                            clvp_input = clvp_input.reshape(clvp_input.shape[0] * clvp_input.shape[1], clvp_input.shape[2])
+                            clvp_out = clvp(clvp_input, batch, return_loss=False)
+                            del clvp_input
+                        if auto_conds is not None and cvvp_amount > 0:
+                            cvvp_accumulator = 0
+                            for cl in range(auto_conds.shape[1]):
+                                cvvp_accumulator = cvvp_accumulator + self.cvvp(auto_conds[:, cl].repeat(batch.shape[0] // text_tokens.shape[0], 1, 1), batch, return_loss=False)
+                            cvvp = cvvp_accumulator / auto_conds.shape[1]
+                            if cvvp_amount == 1:
+                                clip_results.append(cvvp)
                             else:
-                                clip_results.append(clvp_out)
-                        clip_results = torch.cat(clip_results, dim=0)
-                        samples = torch.cat(samples, dim=0)
-                        best_results = samples[torch.topk(clip_results, k=k).indices]
-                else:
-                    with self.temporary_cuda(self.clvp) as clvp:
-                        if cvvp_amount > 0:
-                            if self.cvvp is None:
-                                self.load_cvvp()
-                            self.cvvp = self.cvvp.to(self.device)
-                        if verbose:
-                            if self.cvvp is None:
-                                print("Computing best candidates using CLVP")
-                            else:
-                                print(f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
-                        for batch in tqdm(samples, disable=not verbose):
-                            for i in range(batch.shape[0]):
-                                batch[i] = fix_autoregressive_output(batch[i], self.autoregressive.stop_mel_token)
-                            if cvvp_amount != 1:
-                                clvp_input = text_tokens.reshape(text_tokens.shape[1], 1, -1).repeat(1, batch.shape[0] // text_tokens.shape[1], 1)
-                                clvp_input = clvp_input.reshape(clvp_input.shape[0] * clvp_input.shape[1], clvp_input.shape[2])
-                                clvp_out = clvp(clvp_input, batch, return_loss=False)
-                                del clvp_input
-                            if auto_conds is not None and cvvp_amount > 0:
-                                cvvp_accumulator = 0
-                                for cl in range(auto_conds.shape[1]):
-                                    cvvp_accumulator = cvvp_accumulator + self.cvvp(auto_conds[:, cl].repeat(batch.shape[0] // text_tokens.shape[0], 1, 1), batch, return_loss=False)
-                                cvvp = cvvp_accumulator / auto_conds.shape[1]
-                                if cvvp_amount == 1:
-                                    clip_results.append(cvvp)
-                                else:
-                                    clip_results.append(cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
-                            else:
-                                clip_results.append(clvp_out)
-                        clip_results = torch.cat(clip_results, dim=0)
-                        samples = torch.cat(samples, dim=0)
-                        best_results = torch.cat(
-                            [
-                                samples[
-                                torch.topk(
-                                    clip_results[clip_results.shape[0]//text_tokens.shape[1]*(i-1):clip_results.shape[0]//text_tokens.shape[1]*i],
-                                    k=k
-                                ).indices]
-                                for i in range(1, text_tokens.shape[1] + 1)
-                            ],
-                            dim=0
-                        )
-                if self.cvvp is not None:
-                    self.cvvp = self.cvvp.cpu()
-                del samples
+                                clip_results.append(cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
+                        else:
+                            clip_results.append(clvp_out)
+                    clip_results = torch.cat(clip_results, dim=0)
+                    samples = torch.cat(samples, dim=0)
+                    best_results = torch.cat(
+                        [
+                            samples[
+                            torch.topk(
+                                clip_results[clip_results.shape[0]//text_tokens.shape[1]*(i-1):clip_results.shape[0]//text_tokens.shape[1]*i],
+                                k=k
+                            ).indices]
+                            for i in range(1, text_tokens.shape[1] + 1)
+                        ],
+                        dim=0
+                    )
+            if self.cvvp is not None:
+                self.cvvp = self.cvvp.cpu()
+            del samples
 
-                # The diffusion model actually wants the last hidden layer from the autoregressive model as conditioning
-                # inputs. Re-produce those for the top results. This could be made more efficient by storing all of these
-                # results, but will increase memory usage.
-                if not torch.backends.mps.is_available():
-                    with self.temporary_cuda(
-                        self.autoregressive
-                    ) as autoregressive, torch.autocast(
-                        device_type="cuda" if not torch.backends.mps.is_available() else 'mps', dtype=torch.float16, enabled=self.half
-                    ):
-                        best_latents_li = []
-                        for i in range(text_tokens.shape[1]):
-                            _best_latents = autoregressive(
-                                auto_conditioning.repeat(k, 1),
-                                text_tokens[:, i, :].repeat(k, 1),
-                                torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                                best_results[i].unsqueeze(0),
-                                torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
-                                return_latent=True,
-                                clip_inputs=False
-                            )
-                            best_latents_li.append(_best_latents)
-                        best_latents = torch.cat(best_latents_li, dim=0)
-                        del auto_conditioning
-                else:
-                    with self.temporary_cuda(
-                        self.autoregressive
-                    ) as autoregressive:
-                        best_latents_li = []
-                        for i in range(text_tokens.shape[1]):
-                            _best_latents = autoregressive(
-                                auto_conditioning.repeat(k, 1),
-                                text_tokens[:, i, :].repeat(k, 1),
-                                torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                                best_results[i].unsqueeze(0),
-                                torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
-                                return_latent=True,
-                                clip_inputs=False
-                            )
-                            best_latents_li.append(_best_latents)
-                        best_latents = torch.cat(best_latents_li, dim=0)
-                        del auto_conditioning
+            # The diffusion model actually wants the last hidden layer from the autoregressive model as conditioning
+            # inputs. Re-produce those for the top results. This could be made more efficient by storing all of these
+            # results, but will increase memory usage.
+            if not torch.backends.mps.is_available():
+                with self.temporary_cuda(
+                    self.autoregressive
+                ) as autoregressive, torch.autocast(
+                    device_type="cuda" if not torch.backends.mps.is_available() else 'mps', dtype=torch.float16, enabled=self.half
+                ):
+                    best_latents_li = []
+                    for i in range(text_tokens.shape[1]):
+                        _best_latents = autoregressive(
+                            auto_conditioning.repeat(k, 1),
+                            text_tokens[:, i, :].repeat(k, 1),
+                            torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
+                            best_results[i].unsqueeze(0),
+                            torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
+                            return_latent=True,
+                            clip_inputs=False
+                        )
+                        best_latents_li.append(_best_latents)
+                    best_latents = torch.cat(best_latents_li, dim=0)
+                    del auto_conditioning
+            else:
+                with self.temporary_cuda(
+                    self.autoregressive
+                ) as autoregressive:
+                    best_latents_li = []
+                    for i in range(text_tokens.shape[1]):
+                        _best_latents = autoregressive(
+                            auto_conditioning.repeat(k, 1),
+                            text_tokens[:, i, :].repeat(k, 1),
+                            torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
+                            best_results[i].unsqueeze(0),
+                            torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
+                            return_latent=True,
+                            clip_inputs=False
+                        )
+                        best_latents_li.append(_best_latents)
+                    best_latents = torch.cat(best_latents_li, dim=0)
+                    del auto_conditioning
             return best_results, best_latents
 
     def generate_audio(
